@@ -1,159 +1,90 @@
-from __future__ import annotations
-
-import os
+# src/monitor.py
 import platform
-import shutil
 import subprocess
-from typing import Dict, List, Tuple
+import shutil
+import logging
+from typing import Optional
 
+logger = logging.getLogger(__name__)
 
-def _is_windows() -> bool:
-    return os.name == "nt"
+def _parse_cpu_from_top(output: str) -> Optional[float]:
+    try:
+        # Exemple de ligne: "Cpu(s):  3.0%us,  1.0%sy,  0.0%ni, 95.7%id,  0.3%wa,  0.0%hi,  0.0%si,  0.0%st"
+        for part in output.split(","):
+            if "id" in part:
+                idle = float(part.strip().split("%")[0])
+                return round(100.0 - idle, 1)
+    except Exception:
+        logger.exception("Erreur parsing top CPU")
+    return None
 
+def get_cpu_usage() -> float:
+    """Retourne l'utilisation CPU en pourcentage (0-100)."""
+    try:
+        if platform.system() == "Linux":
+            try:
+                out = subprocess.check_output(["top", "-bn1"], text=True, stderr=subprocess.DEVNULL)
+                cpu = _parse_cpu_from_top(out)
+                if cpu is not None:
+                    return cpu
+            except Exception:
+                logger.debug("top non disponible ou parsing échoué, fallback")
+        # Fallback: utiliser /proc/stat
+        if platform.system() == "Linux":
+            with open("/proc/stat", "r") as f:
+                line = f.readline()
+            parts = line.split()
+            if parts[0].startswith("cpu"):
+                vals = list(map(int, parts[1:]))
+                idle = vals[3]
+                total = sum(vals)
+                # lecture instantanée approximative: on retourne 0 si impossible
+                return 0.0 if total == 0 else round((1.0 - idle / total) * 100.0, 1)
+    except Exception:
+        logger.exception("Impossible de récupérer l'utilisation CPU")
+    return 0.0
 
-def _read_proc_stat() -> Tuple[int, int]:
-    with open("/proc/stat", "r", encoding="utf-8") as f:
-        first_line = f.readline()
+def _parse_meminfo(meminfo: str) -> Optional[float]:
+    try:
+        lines = meminfo.splitlines()
+        info = {}
+        for l in lines:
+            if ":" in l:
+                k, v = l.split(":", 1)
+                info[k.strip()] = int(v.strip().split()[0])
+        if "MemTotal" in info and ("MemAvailable" in info or ("MemFree" in info and "Buffers" in info and "Cached" in info)):
+            total = info["MemTotal"]
+            available = info.get("MemAvailable", info.get("MemFree", 0) + info.get("Buffers", 0) + info.get("Cached", 0))
+            used_pct = round((1.0 - available / total) * 100.0, 1)
+            return used_pct
+    except Exception:
+        logger.exception("Erreur parsing /proc/meminfo")
+    return None
 
-    parts = first_line.split()
-    if not parts or parts[0] != "cpu":
-        raise RuntimeError("Unable to read CPU stats from /proc/stat")
+def get_ram_usage() -> float:
+    """Retourne l'utilisation RAM en pourcentage (0-100)."""
+    try:
+        if platform.system() == "Linux":
+            with open("/proc/meminfo", "r") as f:
+                meminfo = f.read()
+            parsed = _parse_meminfo(meminfo)
+            if parsed is not None:
+                return parsed
+        # Fallback: utiliser shutil if psutil absent (shutil n'a pas pourcentage RAM)
+    except Exception:
+        logger.exception("Impossible de récupérer l'utilisation RAM")
+    return 0.0
 
-    values = [int(x) for x in parts[1:]]
-    idle_time = values[3] + values[4] if len(values) > 4 else values[3]
-    total_time = sum(values)
-    return idle_time, total_time
+def get_disk_usage(path: str = "/") -> float:
+    """Retourne l'utilisation disque en pourcentage pour le chemin donné."""
+    try:
+        total, used, free = shutil.disk_usage(path)
+        if total == 0:
+            return 0.0
+        percent = round(used / total * 100.0, 1)
+        return percent
+    except Exception:
+        logger.exception("Impossible de récupérer l'utilisation disque")
+    return 0.0
 
-
-def _run_command(command: List[str]) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, check=True)
-    return result.stdout.strip()
-
-
-def _parse_key_value_lines(text: str) -> Dict[str, str]:
-    data: Dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if "=" in line:
-            key, value = line.split("=", 1)
-            data[key.strip()] = value.strip()
-    return data
-
-
-def get_cpu_usage(snapshot_only: bool = False, previous_snapshot: Tuple[int, int] | None = None) -> Dict[str, object]:
-    if _is_windows():
-        if snapshot_only:
-            return {"snapshot": None}
-
-        output = _run_command(["wmic", "cpu", "get", "loadpercentage", "/value"])
-        data = _parse_key_value_lines(output)
-        percent = float(data.get("LoadPercentage", 0))
-        return {"percent": round(percent, 2), "snapshot": None}
-
-    current_snapshot = _read_proc_stat()
-
-    if snapshot_only:
-        return {"snapshot": current_snapshot}
-
-    if previous_snapshot is None:
-        raise ValueError("previous_snapshot is required when snapshot_only is False")
-
-    prev_idle, prev_total = previous_snapshot
-    curr_idle, curr_total = current_snapshot
-
-    total_delta = curr_total - prev_total
-    idle_delta = curr_idle - prev_idle
-
-    if total_delta <= 0:
-        percent = 0.0
-    else:
-        percent = (1.0 - (idle_delta / total_delta)) * 100.0
-
-    return {"percent": round(percent, 2), "snapshot": current_snapshot}
-
-
-def get_memory_usage() -> Dict[str, float]:
-    if _is_windows():
-        output = _run_command(["wmic", "OS", "get", "FreePhysicalMemory,TotalVisibleMemorySize", "/Value"])
-        data = _parse_key_value_lines(output)
-
-        total_kb = int(data.get("TotalVisibleMemorySize", "0"))
-        free_kb = int(data.get("FreePhysicalMemory", "0"))
-        used_kb = total_kb - free_kb
-        percent = (used_kb / total_kb) * 100.0 if total_kb else 0.0
-
-        return {
-            "total_gb": round(total_kb / (1024 * 1024), 2),
-            "used_gb": round(used_kb / (1024 * 1024), 2),
-            "percent": round(percent, 2),
-        }
-
-    meminfo = {}
-    with open("/proc/meminfo", "r", encoding="utf-8") as f:
-        for line in f:
-            key, value = line.split(":", 1)
-            meminfo[key.strip()] = value.strip()
-
-    total_kb = int(meminfo["MemTotal"].split()[0])
-    available_kb = int(meminfo.get("MemAvailable", meminfo["MemFree"]).split()[0])
-
-    used_kb = total_kb - available_kb
-    percent = (used_kb / total_kb) * 100.0 if total_kb else 0.0
-
-    return {
-        "total_gb": round(total_kb / (1024 * 1024), 2),
-        "used_gb": round(used_kb / (1024 * 1024), 2),
-        "percent": round(percent, 2),
-    }
-
-
-def get_disk_usage(path: str = "/") -> Dict[str, float]:
-    usage = shutil.disk_usage(path)
-    used = usage.used
-    total = usage.total
-    percent = (used / total) * 100.0 if total else 0.0
-
-    return {
-        "path": path,
-        "total_gb": round(total / (1024**3), 2),
-        "used_gb": round(used / (1024**3), 2),
-        "free_gb": round(usage.free / (1024**3), 2),
-        "percent": round(percent, 2),
-    }
-
-
-def analyze_status(
-    cpu_percent: float,
-    ram_percent: float,
-    disk_percent: float,
-    cpu_threshold: float = 80.0,
-    ram_threshold: float = 80.0,
-    disk_threshold: float = 80.0,
-) -> Dict[str, object]:
-    recommendations: List[str] = []
-
-    cpu_status = "critique" if cpu_percent >= cpu_threshold else "normal"
-    ram_status = "critique" if ram_percent >= ram_threshold else "normal"
-    disk_status = "critique" if disk_percent >= disk_threshold else "normal"
-
-    if cpu_status == "critique":
-        recommendations.append("- Vérifier les processus actifs")
-        recommendations.append("- Identifier les tâches qui consomment trop de CPU")
-
-    if ram_status == "critique":
-        recommendations.append("- Fermer les applications inutiles")
-        recommendations.append("- Redémarrer les services trop gourmands")
-
-    if disk_status == "critique":
-        recommendations.append("- Libérer de l’espace disque")
-        recommendations.append("- Supprimer les fichiers temporaires inutiles")
-
-    if not recommendations:
-        recommendations.append("- Aucun problème critique détecté")
-
-    return {
-        "cpu_status": cpu_status,
-        "ram_status": ram_status,
-        "disk_status": disk_status,
-        "recommendations": recommendations,
     }
