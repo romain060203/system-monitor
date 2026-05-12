@@ -1,23 +1,20 @@
-from argparse import ArgumentParser, Namespace
-from pathlib import Path
-from datetime import datetime
+# utils.py
+import logging
+from logging.handlers import RotatingFileHandler
+import os
 
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "monitor.log")
 
-def parse_args(argv: list[str]) -> Namespace:
-    parser = ArgumentParser(description="Outil simple de monitoring système")
-    parser.add_argument("--interval", type=int, default=5, help="Intervalle entre deux mesures en secondes")
-    parser.add_argument("--loops", type=int, default=1, help="Nombre de cycles. 0 = infini")
-    parser.add_argument("--output", type=str, default="reports/system_report.txt", help="Fichier de rapport")
-    parser.add_argument("--disk-path", type=str, default="C:\\", help="Chemin à analyser pour le disque")
-    parser.add_argument("--cpu-threshold", type=float, default=80.0, help="Seuil CPU en %")
-    parser.add_argument("--ram-threshold", type=float, default=80.0, help="Seuil RAM en %")
-    parser.add_argument("--disk-threshold", type=float, default=80.0, help="Seuil disque en %")
-    return parser.parse_args(argv)
-
-
-def ensure_parent_dir(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def now_string() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def setup_logging(level=logging.INFO, max_bytes=5*1024*1024, backup_count=3):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logger = logging.getLogger()
+    logger.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    handler = RotatingFileHandler(LOG_FILE, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+    handler.setFormatter(fmt)
+    logger.addHandler(handler)
+    # also log to console
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    logger.addHandler(console)
