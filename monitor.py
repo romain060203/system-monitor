@@ -1,4 +1,4 @@
-# src/monitor.py
+# monitor.py
 import platform
 import subprocess
 import shutil
